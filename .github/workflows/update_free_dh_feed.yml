@@ -34,7 +34,7 @@ jobs:
         run: |
           git config --global user.name "GitHub Action"
           git config --global user.email "action@github.com"
-          git add dh_modified_feed.xml
+          git add dh_free_feed.xml
           git commit -m "Update XML feed" || echo "No changes to commit"
           git pull --rebase
           git push
