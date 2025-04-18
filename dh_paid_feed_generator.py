@@ -272,10 +272,16 @@ async def main_async():
         lastBuildDate=datetime.datetime.now(datetime.timezone.utc),
         items=all_items
     )
-    xml_str = feed.to_xml(encoding="utf-8")
-    dom = xml.dom.minidom.parseString(xml_str)
-    pretty = '\n'.join(line for line in dom.toprettyxml(indent="  ").splitlines() if line.strip())
-    with open("dh_paid_feed.xml", "w", encoding="utf-8") as f:
+    output_file = "dh_paid_feed.xml"
+    # write out using your CustomRSS2.writexml (which includes volume, chaptername, translator, etc.)
+    with open(output_file, "w", encoding="utf-8") as f:
+        feed.writexml(f, indent="  ", addindent="  ", newl="\n")
+
+    # (optional) re–pretty–print it
+    with open(output_file, "r", encoding="utf-8") as f:
+        dom = xml.dom.minidom.parseString(f.read())
+    pretty = "\n".join(line for line in dom.toprettyxml(indent="  ").splitlines() if line.strip())
+    with open(output_file, "w", encoding="utf-8") as f:
         f.write(pretty)
     print(f"Feed generated with {len(all_items)} items.")
 
