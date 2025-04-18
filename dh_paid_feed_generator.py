@@ -260,6 +260,12 @@ async def process_novel(session, title: str):
         pd = chap["pubDate"]
         if pd.tzinfo is None:
             pd = pd.replace(tzinfo=datetime.timezone.utc)
+        
+        # Round to the nearest hour:
+        if pd.minute >= 30:
+            pd = pd + datetime.timedelta(hours=1)
+        
+        pd = pd.replace(minute=0, second=0, microsecond=0)
         items.append(MyRSSItem(
             title=title,
             volume=chap["volume"],
