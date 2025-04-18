@@ -242,6 +242,9 @@ async def process_novel(session, novel_title):
             pd = c["pubDate"]
             if pd.tzinfo is None:
                 pd = pd.replace(tzinfo=datetime.timezone.utc)
+            # ─── round down to the top of the hour ───
+            pd = pd.replace(minute=0, second=0, microsecond=0)
+            
             item = MyRSSItem(
                 title=novel_title,
                 volume=c["volume"],
