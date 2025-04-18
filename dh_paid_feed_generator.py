@@ -8,241 +8,299 @@ import PyRSS2Gen
 import xml.dom.minidom
 from xml.sax.saxutils import escape
 
-# Import mapping functions and data from your mappings file
 from dh_mappings import (
     TRANSLATOR_NOVEL_MAP,
-    get_novel_url,
+    NOVEL_URL_OVERRIDES,
     get_featured_image,
     get_translator,
     get_discord_role_id,
     get_nsfw_novels
 )
 
-# Limit concurrent fetches
 semaphore = asyncio.Semaphore(100)
 
-# ---------------- Helper Functions ----------------
+def slugify_title(title: str) -> str:
+    """Make the slug fallback URL for a given novel title."""
+    slug = title.lower()
+    slug = re.sub(r"[^\w\s-]", "", slug)
+    slug = re.sub(r"[\s]+", "-", slug)
+    return f"https://dragonholic.com/novel/{slug}/"
 
-def slugify(text):
-    text = text.lower()
-    text = re.sub(r"[^\w\s-]", "", text)
-    return re.sub(r"[\s]+", "-", text)
+async def fetch_page(session, url: str) -> str:
+    """Fetch a page; on non-200 or exception, log & return empty string."""
+    try:
+        async with session.get(url) as resp:
+            if resp.status != 200:
+                print(f"⚠️  Warning: {url} returned HTTP {resp.status}")
+                return ""
+            return await resp.text()
+    except Exception as e:
+        print(f"⚠️  Error fetching {url}: {e}")
+        return ""
 
-
-def clean_description(raw_desc):
+def clean_description(raw_desc: str) -> str:
     soup = BeautifulSoup(raw_desc, "html.parser")
-    for div in soup.find_all("div", class_="c-content-readmore"):
+    for div in soup.select("div.c-content-readmore"):
         div.decompose()
     cleaned = soup.decode_contents()
     return re.sub(r'\s+', ' ', cleaned).strip()
 
+def split_title(full_title: str):
+    parts = full_title.split(" - ", 1)
+    if len(parts) == 2:
+        return parts[0].strip(), parts[1].strip()
+    return full_title.strip(), ""
 
-def extract_pubdate_from_soup(chap):
-    span = chap.find("span", class_="chapter-release-date")
-    if span and span.find("i"):
-        date_str = span.find("i").get_text(strip=True)
-        try:
-            return datetime.datetime.strptime(date_str, "%B %d, %Y").replace(tzinfo=datetime.timezone.utc)
-        except:
-            now = datetime.datetime.now(datetime.timezone.utc)
-            parts = date_str.lower().split()
-            if parts and parts[0].isdigit():
-                num = int(parts[0])
-                unit = parts[1]
-                if "minute" in unit:
-                    return now - datetime.timedelta(minutes=num)
-                if "hour" in unit:
-                    return now - datetime.timedelta(hours=num)
-                if "day" in unit:
-                    return now - datetime.timedelta(days=num)
-                if "week" in unit:
-                    return now - datetime.timedelta(weeks=num)
-    return datetime.datetime.now(datetime.timezone.utc)
+def extract_pubdate_from_soup(chap) -> datetime.datetime:
+    span = chap.select_one("span.chapter-release-date i")
+    if not span:
+        return datetime.datetime.now(datetime.timezone.utc)
+    date_str = span.get_text(strip=True)
+    try:
+        # absolute date
+        return datetime.datetime.strptime(date_str, "%B %d, %Y")\
+                .replace(tzinfo=datetime.timezone.utc)
+    except:
+        # relative
+        now = datetime.datetime.now(datetime.timezone.utc)
+        parts = date_str.lower().split()
+        if parts and parts[0].isdigit():
+            num = int(parts[0]); unit = parts[1]
+            if "minute" in unit: return now - datetime.timedelta(minutes=num)
+            if "hour"   in unit: return now - datetime.timedelta(hours=num)
+            if "day"    in unit: return now - datetime.timedelta(days=num)
+            if "week"   in unit: return now - datetime.timedelta(weeks=num)
+    return now
 
+def chapter_num(chaptername: str):
+    nums = re.findall(r'\d+(?:\.\d+)?', chaptername)
+    return tuple(float(n) if '.' in n else int(n) for n in nums) if nums else (0,)
 
-def normalize_date(dt):
+def normalize_date(dt: datetime.datetime) -> datetime.datetime:
     return dt.replace(microsecond=0)
 
-# ---------------- Async Fetch ----------------
+async def scrape_paid_chapters_async(session, base_url: str):
+    """
+    Fetch & parse the paid chapters from a novel page.
+    Returns (list_of_dicts, main_description).
+    """
+    html = await fetch_page(session, base_url)
+    if not html:
+        return [], ""
+    soup = BeautifulSoup(html, "html.parser")
 
-async def fetch_page(session, url):
-    async with session.get(url) as resp:
-        resp.raise_for_status()
-        return await resp.text()
-
-async def scrape_paid_chapters_async(session, novel_url):
-    html = await fetch_page(session, novel_url)
-    soup = BeautifulSoup(html, 'html.parser')
-
-    # main description
-    desc = soup.find('div', class_='description-summary')
-    main_desc = clean_description(desc.decode_contents()) if desc else ''
+    # description
+    desc_div = soup.select_one("div.description-summary")
+    main_desc = clean_description(desc_div.decode_contents()) if desc_div else ""
 
     paid = []
     now = datetime.datetime.now(datetime.timezone.utc)
 
-    # 1) Volume-based
-    vol_list = soup.select('ul.main.version-chap.volumns > li.parent.has-child')
-    for parent in vol_list:
-        vol_text = parent.select_one('a.has-child').get_text(strip=True)
-        vol_slug = slugify(vol_text)
-        for chap_li in parent.select('ul.sub-chap-list li.wp-manga-chapter'):
-            if 'free-chap' in chap_li.get('class', []): continue
-            pub = extract_pubdate_from_soup(chap_li)
-            if pub < now - datetime.timedelta(days=7): continue
+    # volume‐based
+    vol_ul = soup.select_one("ul.main.version-chap.volumns")
+    if vol_ul:
+        for vol_parent in vol_ul.select("li.parent.has-child"):
+            vol_label = vol_parent.select_one("a.has-child").get_text(strip=True)
+            m = re.match(r".*?(\d+(?:\.\d+)?).*", vol_label)
+            vol_id = m.group(1) if m else vol_label
 
-            a = chap_li.find('a')
-            raw = a.get_text(' ', strip=True)
-            # split raw into number + title
-            num, rest = raw.split(' ', 1) if ' ' in raw else (raw, '')
-            chap_slug = slugify(raw)
-            href = a.get('href', '').strip()
-            link = href if href and href != '#' else f"{novel_url}{vol_slug}/{chap_slug}/"
+            for chap_li in vol_parent.select("ul.sub-chap-list li.wp-manga-chapter"):
+                if "free-chap" in chap_li.get("class", []):
+                    continue
+                pub_dt = extract_pubdate_from_soup(chap_li)
+                if pub_dt < now - datetime.timedelta(days=7):
+                    continue
 
-            guid = next((c.split('data-chapter-')[1] for c in chap_li.get('class', []) if c.startswith('data-chapter-')), chap_slug)
-            coin = chap_li.find('span', class_='coin')
-            coin = coin.get_text(strip=True) if coin else ''
+                a = chap_li.find("a")
+                raw_title = a.get_text(" ", strip=True)
+                chap_name, nameext = split_title(raw_title)
+                num_m = re.search(r"(\d+(?:\.\d+)?)", chap_name)
+                chap_id = num_m.group(1) if num_m else ""
+                href = a.get("href","").strip()
+                link = href if href and href != "#" else f"{base_url}{vol_id}/{chap_id}/"
+
+                guid = next((c.split("data-chapter-")[1]
+                             for c in chap_li.get("class",[])
+                             if c.startswith("data-chapter-")), chap_id)
+                coin = chap_li.select_one("span.coin").get_text(strip=True) \
+                       if chap_li.select_one("span.coin") else ""
+
+                paid.append({
+                    "volume":      vol_id,
+                    "chaptername": chap_name,
+                    "nameextend":  nameext,
+                    "link":        link,
+                    "description": main_desc,
+                    "pubDate":     pub_dt,
+                    "guid":        guid,
+                    "coin":        coin
+                })
+
+    # no‐volume
+    no_vol_ul = soup.select_one("ul.main.version-chap.no-volumn")
+    if no_vol_ul:
+        for chap_li in no_vol_ul.select("li.wp-manga-chapter"):
+            if "free-chap" in chap_li.get("class", []):
+                continue
+            pub_dt = extract_pubdate_from_soup(chap_li)
+            if pub_dt < now - datetime.timedelta(days=7):
+                continue
+
+            a = chap_li.find("a")
+            raw_title = a.get_text(" ", strip=True)
+            chap_name, nameext = split_title(raw_title)
+            num_m = re.search(r"(\d+(?:\.\d+)?)", chap_name)
+            chap_id = num_m.group(1) if num_m else ""
+            href = a.get("href","").strip()
+            link = href if href and href != "#" else f"{base_url}chapter-{chap_id}/"
+
+            guid = next((c.split("data-chapter-")[1]
+                         for c in chap_li.get("class",[])
+                         if c.startswith("data-chapter-")), chap_id)
+            coin = chap_li.select_one("span.coin").get_text(strip=True) \
+                   if chap_li.select_one("span.coin") else ""
 
             paid.append({
-                'volume': vol_text,
-                'chaptername': num.strip(),
-                'nameextend': rest.strip(),
-                'link': link,
-                'description': main_desc,
-                'pubDate': pub,
-                'guid': guid,
-                'coin': coin
+                "volume":      "",
+                "chaptername": chap_name,
+                "nameextend":  nameext,
+                "link":        link,
+                "description": main_desc,
+                "pubDate":     pub_dt,
+                "guid":        guid,
+                "coin":        coin
             })
 
-    # 2) No-volume
-    for chap_li in soup.select('ul.main.version-chap.no-volumn li.wp-manga-chapter'):
-        if 'free-chap' in chap_li.get('class', []): continue
-        pub = extract_pubdate_from_soup(chap_li)
-        if pub < now - datetime.timedelta(days=7): continue
-
-        a = chap_li.find('a')
-        raw = a.get_text(' ', strip=True)
-        num, rest = raw.split(' ', 1) if ' ' in raw else (raw, '')
-        chap_slug = slugify(raw)
-        href = a.get('href', '').strip()
-        link = href if href and href != '#' else f"{novel_url}{chap_slug}/"
-
-        guid = next((c.split('data-chapter-')[1] for c in chap_li.get('class', []) if c.startswith('data-chapter-')), chap_slug)
-        coin = chap_li.find('span', class_='coin')
-        coin = coin.get_text(strip=True) if coin else ''
-
-        paid.append({
-            'volume': '',
-            'chaptername': num.strip(),
-            'nameextend': rest.strip(),
-            'link': link,
-            'description': main_desc,
-            'pubDate': pub,
-            'guid': guid,
-            'coin': coin
-        })
-
-    return paid
-
-# ---------------- RSS Classes ----------------
+    return paid, main_desc
 
 class MyRSSItem(PyRSS2Gen.RSSItem):
-    def __init__(self, *args, volume='', chaptername='', nameextend='', coin='', **kwargs):
-        self.volume = volume
+    def __init__(self, *args, volume="", chaptername="", nameextend="", coin="", **kwargs):
+        self.volume      = volume
         self.chaptername = chaptername
-        self.nameextend = nameextend
-        self.coin = coin
+        self.nameextend  = nameextend
+        self.coin        = coin
         super().__init__(*args, **kwargs)
 
-    def writexml(self, writer, indent='', addindent='', newl=''):
-        writer.write(indent + '<item>' + newl)
-        writer.write(indent + addindent + f'<title>{escape(self.title)}</title>' + newl)
-        writer.write(indent + addindent + f'<volume>{escape(self.volume)}</volume>' + newl)
-        writer.write(indent + addindent + f'<chaptername>{escape(self.chaptername)}</chaptername>' + newl)
-        ext = f'***{self.nameextend}***' if self.nameextend else ''
-        writer.write(indent + addindent + f'<nameextend>{escape(ext)}</nameextend>' + newl)
-        writer.write(indent + addindent + f'<link>{escape(self.link)}</link>' + newl)
-        writer.write(indent + addindent + f'<description><![CDATA[{self.description}]]></description>' + newl)
-        cat = 'NSFW' if self.title in get_nsfw_novels() else 'SFW'
-        writer.write(indent + addindent + f'<category>{cat}</category>' + newl)
-        trans = get_translator(self.title) or ''
-        writer.write(indent + addindent + f'<translator>{escape(trans)}</translator>' + newl)
+    def writexml(self, writer, indent="", addindent="", newl=""):
+        w = writer.write
+        w(f"{indent}  <item>{newl}")
+        w(f"{indent}    <title>{escape(self.title)}</title>{newl}")
+        w(f"{indent}    <volume>{escape(self.volume)}</volume>{newl}")
+        w(f"{indent}    <chaptername>{escape(self.chaptername)}</chaptername>{newl}")
+        ext = f"***{self.nameextend}***" if self.nameextend.strip() else ""
+        w(f"{indent}    <nameextend>{escape(ext)}</nameextend>{newl}")
+        w(f"{indent}    <link>{escape(self.link)}</link>{newl}")
+        w(f"{indent}    <description><![CDATA[{self.description}]]></description>{newl}")
+        cat = "NSFW" if self.title in get_nsfw_novels() else "SFW"
+        w(f"{indent}    <category>{escape(cat)}</category>{newl}")
+        trans = get_translator(self.title) or ""
+        w(f"{indent}    <translator>{escape(trans)}</translator>{newl}")
         role = get_discord_role_id(trans)
-        if cat == 'NSFW': role += ' <@&1304077473998442506>'
-        writer.write(indent + addindent + f'<discord_role_id><![CDATA[{role}]]></discord_role_id>' + newl)
-        writer.write(indent + addindent + f'<featuredImage url="{escape(get_featured_image(self.title))}"/>' + newl)
+        if cat=="NSFW": role += " <@&1304077473998442506>"
+        w(f"{indent}    <discord_role_id><![CDATA[{role}]]></discord_role_id>{newl}")
+        w(f"{indent}    <featuredImage url=\"{escape(get_featured_image(self.title))}\"/>{newl}")
         if self.coin:
-            writer.write(indent + addindent + f'<coin>{escape(self.coin)}</coin>' + newl)
-        writer.write(indent + addindent + f'<pubDate>{self.pubDate.strftime("%a, %d %b %Y %H:%M:%S +0000")}</pubDate>' + newl)
-        writer.write(indent + addindent + f'<guid isPermaLink="false">{escape(self.guid.guid)}</guid>' + newl)
-        writer.write(indent + '</item>' + newl)
+            w(f"{indent}    <coin>{escape(self.coin)}</coin>{newl}")
+        w(f"{indent}    <pubDate>{self.pubDate.strftime('%a, %d %b %Y %H:%M:%S +0000')}</pubDate>{newl}")
+        w(f"{indent}    <guid isPermaLink=\"false\">{escape(self.guid.guid)}</guid>{newl}")
+        w(f"{indent}  </item>{newl}")
 
 class CustomRSS2(PyRSS2Gen.RSS2):
-    def writexml(self, writer, indent='', addindent='', newl=''):
-        writer.write('<?xml version="1.0" encoding="utf-8"?>' + newl)
-        writer.write('<rss version="2.0" ' +
-                     'xmlns:content="http://purl.org/rss/1.0/modules/content/" ' +
-                     'xmlns:wfw="http://wellformedweb.org/CommentAPI/" ' +
-                     'xmlns:dc="http://purl.org/dc/elements/1.1/" ' +
-                     'xmlns:atom="http://www.w3.org/2005/Atom" ' +
-                     'xmlns:sy="http://purl.org/rss/1.0/modules/syndication/" ' +
-                     'xmlns:slash="http://purl.org/rss/1.0/modules/slash/" ' +
-                     'xmlns:webfeeds="http://www.webfeeds.org/rss/1.0" ' +
-                     'xmlns:georss="http://www.georss.org/georss" ' +
-                     'xmlns:geo="http://www.w3.org/2003/01/geo/wgs84_pos#"' +
-                     '>' + newl)
-        writer.write(indent + '<channel>' + newl)
-        props = ['title','link','description','language','lastBuildDate','docs','generator','ttl']
-        for p in props:
-            val = getattr(self, p, None)
+    def writexml(self, writer, indent="", addindent="", newl=""):
+        w = writer.write
+        w(f'<?xml version="1.0" encoding="utf-8"?>{newl}')
+        w('<rss xmlns:content="http://purl.org/rss/1.0/modules/content/" '
+          'xmlns:wfw="http://wellformedweb.org/CommentAPI/" '
+          'xmlns:dc="http://purl.org/dc/elements/1.1/" '
+          'xmlns:atom="http://www.w3.org/2005/Atom" '
+          'xmlns:sy="http://purl.org/rss/1.0/modules/syndication/" '
+          'xmlns:slash="http://purl.org/rss/1.0/modules/slash/" '
+          'xmlns:webfeeds="http://www.webfeeds.org/rss/1.0" '
+          'xmlns:georss="http://www.georss.org/georss" '
+          'xmlns:geo="http://www.w3.org/2003/01/geo/wgs84_pos#" '
+          'version="2.0">' + newl)
+        w(indent + "<channel>" + newl)
+        for tag in ("title","link","description","language","lastBuildDate","docs","generator","ttl"):
+            val = getattr(self, tag, None)
             if val:
-                if p=='lastBuildDate':
+                if tag=="lastBuildDate":
                     val = val.strftime("%a, %d %b %Y %H:%M:%S +0000")
-                writer.write(indent+addindent+f'<{p}>{escape(str(val))}</{p}>' + newl)
-        for i in self.items:
-            i.writexml(writer, indent+addindent, addindent, newl)
-        writer.write(indent + '</channel>' + newl)
-        writer.write('</rss>')
+                w(f"{indent}{addindent}<{tag}>{escape(str(val))}</{tag}>{newl}")
+        for item in self.items:
+            item.writexml(writer, indent+addindent, addindent, newl)
+        w(indent + "</channel>" + newl)
+        w("</rss>" + newl)
 
-# ---------------- Main ----------------
-async def main_async():
+async def process_novel(session, title: str):
+    # Build list of URLs to try: override first, then slug.
+    override = NOVEL_URL_OVERRIDES.get(title)
+    slugged = slugify_title(title)
+    to_try = ([override] if override else []) + [slugged]
+
+    base_url = None
+    for url in to_try:
+        html = await fetch_page(session, url)
+        if html:
+            base_url = url
+            break
+    if not base_url:
+        print(f"❌  Could not fetch ANY page for '{title}', skipping.")
+        return []
+
+    # quick check: any paid update in last 7d?
+    paid_list, _ = await scrape_paid_chapters_async(session, base_url)
+    if not paid_list:
+        # no recent paid chapters, skip
+        return []
+
+    # now full scrape
+    chapters, _ = await scrape_paid_chapters_async(session, base_url)
     items = []
-    async with aiohttp.ClientSession() as sess:
-        tasks = [scrape_paid_chapters_async(sess, get_novel_url(n)) for t in TRANSLATOR_NOVEL_MAP.values() for n in t]
-        results = await asyncio.gather(*tasks)
-        for chaps in results:
-            for c in chaps:
-                pd = c['pubDate']
-                if pd.tzinfo is None:
-                    pd = pd.replace(tzinfo=datetime.timezone.utc)
-                items.append(
-                    MyRSSItem(
-                        title=[k for k,v in TRANSLATOR_NOVEL_MAP.items() if any(n==k for n_list in [v] for n in n_list)][0],
-                        volume=c['volume'],
-                        chaptername=c['chaptername'],
-                        nameextend=c['nameextend'],
-                        link=c['link'],
-                        description=c['description'],
-                        guid=PyRSS2Gen.Guid(c['guid'], isPermaLink=False),
-                        pubDate=pd,
-                        coin=c['coin']
-                    )
-                )
-    items.sort(key=lambda x:(normalize_date(x.pubDate),), reverse=True)
+    for chap in chapters:
+        pd = chap["pubDate"]
+        if pd.tzinfo is None:
+            pd = pd.replace(tzinfo=datetime.timezone.utc)
+        items.append(MyRSSItem(
+            title=title,
+            volume=chap["volume"],
+            chaptername=chap["chaptername"],
+            nameextend=chap["nameextend"],
+            link=chap["link"],
+            description=chap["description"],
+            guid=PyRSS2Gen.Guid(chap["guid"], isPermaLink=False),
+            pubDate=pd,
+            coin=chap.get("coin","")
+        ))
+    return items
+
+async def main_async():
+    all_items = []
+    async with aiohttp.ClientSession() as session:
+        tasks = [process_novel(session, t) for novels in TRANSLATOR_NOVEL_MAP.values() for t in novels]
+        for result in await asyncio.gather(*tasks):
+            all_items.extend(result)
+
+    # sort descending
+    all_items.sort(key=lambda it:(normalize_date(it.pubDate), chapter_num(it.chaptername)), reverse=True)
+
     feed = CustomRSS2(
         title="Dragonholic Paid Chapters",
         link="https://dragonholic.com",
-        description="Aggregated RSS feed for paid chapters.",
+        description="Aggregated RSS feed for paid chapters across mapped novels.",
         lastBuildDate=datetime.datetime.now(datetime.timezone.utc),
-        items=items
+        items=all_items
     )
-    with open('dh_paid_feed.xml','w',encoding='utf-8') as f:
-        feed.writexml(f,indent='  ',addindent='  ',newl='\n')
-    # pretty print
-    txt = xml.dom.minidom.parseString(open('dh_paid_feed.xml','r',encoding='utf-8').read())
-    with open('dh_paid_feed.xml','w',encoding='utf-8') as f:
-        f.write('\n'.join([l for l in txt.toprettyxml(indent='  ').splitlines() if l.strip()]))
-    print(f"Feed generated with {len(items)} items.")
+    # write & prettify
+    xml_path = "dh_paid_feed.xml"
+    with open(xml_path, "w", encoding="utf-8") as f:
+        feed.writexml(f, indent="  ", addindent="  ", newl="\n")
+    pretty = xml.dom.minidom.parseString(open(xml_path, "r", encoding="utf-8").read())\
+              .toprettyxml(indent="  ")
+    with open(xml_path, "w", encoding="utf-8") as f:
+        # strip blank lines
+        f.write("\n".join(l for l in pretty.splitlines() if l.strip()))
 
-if __name__=='__main__':
+    print(f"✅  Feed generated with {len(all_items)} items.")
+
+if __name__ == "__main__":
     asyncio.run(main_async())
